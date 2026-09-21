@@ -116,8 +116,8 @@ func (s *Sink) UpsertComment(ctx context.Context, dest source.Repo, destIssueNum
 	}
 
 	if existing == nil {
-		if _, _, err := s.client.Issues.CreateComment(ctx, dest.Owner, dest.Name, int(destIssueNumber), &gh.IssueComment{
-			Body: gh.Ptr(body),
+		if _, _, err := s.client.Issues.CreateComment(ctx, dest.Owner, dest.Name, int(destIssueNumber), gh.IssueCommentRequest{
+			Body: body,
 		}); err != nil {
 			return fmt.Errorf("create comment: %w", err)
 		}
@@ -138,8 +138,8 @@ func (s *Sink) UpsertComment(ctx context.Context, dest source.Repo, destIssueNum
 			"comment_id", existing.GetID())
 		return nil
 	}
-	if _, _, err := s.client.Issues.EditComment(ctx, dest.Owner, dest.Name, existing.GetID(), &gh.IssueComment{
-		Body: gh.Ptr(body),
+	if _, _, err := s.client.Issues.UpdateComment(ctx, dest.Owner, dest.Name, existing.GetID(), gh.IssueCommentRequest{
+		Body: body,
 	}); err != nil {
 		return fmt.Errorf("edit comment: %w", err)
 	}
@@ -159,8 +159,8 @@ func (s *Sink) UpsertComment(ctx context.Context, dest source.Repo, destIssueNum
 // it out and never echoes it back into Forgejo.
 func (s *Sink) CommentAndClosePullRequest(ctx context.Context, dest source.Repo, number int64, comment string, m marker.Marker) error {
 	body := marker.WithMarker(comment, m)
-	if _, _, err := s.client.Issues.CreateComment(ctx, dest.Owner, dest.Name, int(number), &gh.IssueComment{
-		Body: gh.Ptr(body),
+	if _, _, err := s.client.Issues.CreateComment(ctx, dest.Owner, dest.Name, int(number), gh.IssueCommentRequest{
+		Body: body,
 	}); err != nil {
 		return fmt.Errorf("comment on promoted PR: %w", err)
 	}
