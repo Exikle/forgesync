@@ -5,6 +5,8 @@
 //	        mirror flow back into the source-of-truth)
 //	Flow B: canonical → each push_mirror target (issues/comments filed in
 //	        the canonical Forgejo flow out to the mirror)
+//	Upstream: when a GitHub target is a fork, the PRs its owner opened on the
+//	        parent repo → canonical (read-only; nothing is written upstream)
 //
 // Loop prevention: items whose body contains a forgesync marker are shadows
 // (forgesync wrote them); they are filtered out at read time on every side.
@@ -44,6 +46,7 @@ const (
 	syncCommand         = "/sync"
 	prTitlePrefix       = "[PR #"
 	stateOpen           = "open"
+	localOnlyLabel      = "local-only"
 )
 
 // forgejoClient is the canonical Forgejo SDK surface the engine drives.
@@ -60,6 +63,13 @@ type forgejoClient interface {
 // pullRequestSource fetches a source-forge PR for promotion (GitHub today).
 type pullRequestSource interface {
 	GetPullRequest(ctx context.Context, repo source.Repo, number int64) (source.PullRequest, error)
+}
+
+// upstreamSource finds the repo a GitHub mirror was forked from, and reads the
+// pull requests the fork's owner opened there (GitHub today).
+type upstreamSource interface {
+	Parent(ctx context.Context, repo source.Repo) (source.Repo, bool, error)
+	UpstreamPullRequests(author string) source.Provider
 }
 
 // canonicalPRSink is the canonical sink as used by the promotion path: a
@@ -85,6 +95,7 @@ type Engine struct {
 	cfg      *config.Config
 	fjClient forgejoClient     // canonical Forgejo SDK ops
 	ghPRs    pullRequestSource // fetches GitHub PRs to promote
+	upstream upstreamSource    // reads the fork owner's PRs on the parent repo
 	log      *slog.Logger
 
 	// Canonical Forgejo as both source (for Flow B reads) and sink (for Flow A writes).
@@ -98,6 +109,11 @@ type Engine struct {
 	// Inbound (Flow A) sources per host, lazily populated.
 	githubSrc   *ghsource.Provider
 	forgejoSrcs map[string]*fjsource.Provider
+
+	// Resume points per flow: the start of its last successful run. In memory
+	// only; after a restart the first tick's InitialBackfill covers the gap.
+	initialSince time.Time
+	lastSynced   map[string]time.Time
 }
 
 func New(cfg *config.Config, log *slog.Logger) (*Engine, error) {
@@ -117,6 +133,7 @@ func New(cfg *config.Config, log *slog.Logger) (*Engine, error) {
 		cfg:           cfg,
 		fjClient:      srcClient,
 		ghPRs:         githubSrc,
+		upstream:      githubSrc,
 		log:           log,
 		canonicalSrc:  fjsource.NewWithClient(srcClient, canonicalHost),
 		canonicalSink: fjsink.New(srcClient, cfg.Bot.Username, log),
@@ -133,8 +150,8 @@ func (e *Engine) Run(ctx context.Context) error {
 
 	// First tick uses the wider InitialBackfill window so we catch activity
 	// from before the daemon started.
-	initialSince := time.Now().Add(-e.cfg.InitialBackfill)
-	if err := e.tick(ctx, initialSince); err != nil && !errors.Is(err, context.Canceled) {
+	e.initialSince = time.Now().Add(-e.cfg.InitialBackfill)
+	if err := e.tick(ctx, e.initialSince); err != nil && !errors.Is(err, context.Canceled) {
 		e.log.Error("initial tick failed", "err", err)
 	}
 
@@ -210,6 +227,13 @@ func (e *Engine) syncRepo(ctx context.Context, repo *gitea.Repository, since tim
 		e.log.Warn("skip repo: unexpected full name", "full_name", repo.FullName)
 		return nil
 	}
+	// Listing push mirrors needs repo admin, but the search returns every repo
+	// the token can read. Skip the rest here instead of failing on each tick.
+	// A server that doesn't report permissions gets the old behaviour.
+	if repo.Permissions != nil && !repo.Permissions.Admin {
+		e.log.Debug("skip repo: token is not a repo admin", "repo", repo.FullName)
+		return nil
+	}
 	mirrors, _, err := e.fjClient.ListPushMirrors(owner, name, gitea.ListOptions{})
 	if err != nil {
 		return err
@@ -219,6 +243,12 @@ func (e *Engine) syncRepo(ctx context.Context, repo *gitea.Repository, since tim
 	}
 
 	canonical := source.Repo{Owner: owner, Name: name}
+	mirrored := map[string]bool{}
+	for _, m := range mirrors {
+		if host, target, err := parseRemoteRepo(m.RemoteAddress); err == nil {
+			mirrored[strings.ToLower(host+"/"+target.Slug())] = true
+		}
+	}
 	for _, m := range mirrors {
 		host, target, err := parseRemoteRepo(m.RemoteAddress)
 		if err != nil {
@@ -226,20 +256,95 @@ func (e *Engine) syncRepo(ctx context.Context, repo *gitea.Repository, since tim
 			continue
 		}
 
+		mirror := host + "/" + target.Slug()
 		// Flow A: target → canonical
-		if err := e.syncInbound(ctx, canonical, host, target, since); err != nil {
+		if err := e.runFlow(canonical.Slug()+"<-"+mirror, since, func(since time.Time) error {
+			return e.syncInbound(ctx, canonical, host, target, since)
+		}); err != nil {
 			e.log.Error("flow A failed", "repo", repo.FullName, "remote", m.RemoteAddress, "err", err)
 		}
 		// Flow B: canonical → target
-		if err := e.syncOutbound(ctx, canonical, host, target, since); err != nil {
+		if err := e.runFlow(canonical.Slug()+"->"+mirror, since, func(since time.Time) error {
+			return e.syncOutbound(ctx, canonical, host, target, since)
+		}); err != nil {
 			e.log.Error("flow B failed", "repo", repo.FullName, "remote", m.RemoteAddress, "err", err)
 		}
 		// /sync command flow: promote PR-shadow issues to real Forgejo PRs.
 		if err := e.detectAndPromotePRs(ctx, canonical, host, target); err != nil {
 			e.log.Error("PR promotion pass failed", "repo", repo.FullName, "remote", m.RemoteAddress, "err", err)
 		}
+		// Upstream flow: the fork owner's PRs on the parent repo → canonical.
+		if err := e.syncUpstreamPRs(ctx, canonical, host, target, since, mirrored); err != nil {
+			e.log.Error("upstream PR sync failed", "repo", repo.FullName, "remote", m.RemoteAddress, "err", err)
+		}
 	}
 	return nil
+}
+
+// syncUpstreamPRs mirrors the pull requests the fork's owner opened on the
+// repo a GitHub mirror was forked from into canonical as "[upstream PR #N]"
+// issues, with their comments and open/closed state. It is read-only: the
+// shadows' markers point at the parent, which is not a mirror target, so Flow
+// B treats them as foreign and nothing is written upstream.
+//
+// mirrored holds this repo's mirror targets as lower-cased "host/owner/name".
+// When the parent is one of them, Flow A already imports its PRs, and the two
+// flows would fight over the same shadows, so this one stands down.
+func (e *Engine) syncUpstreamPRs(ctx context.Context, canonical source.Repo, host string, target source.Repo, since time.Time, mirrored map[string]bool) error {
+	if host != githubHost || e.cfg.Targets.GitHub.Token == "" {
+		return nil
+	}
+	parent, ok, err := e.upstream.Parent(ctx, target)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	upstream := host + "/" + parent.Slug()
+	if mirrored[strings.ToLower(upstream)] {
+		e.log.Debug("skip upstream PRs: parent is also a mirror target",
+			"repo", canonical.Slug(), "parent", parent.Slug())
+		return nil
+	}
+	src := e.upstream.UpstreamPullRequests(target.Owner)
+	return e.runFlow(canonical.Slug()+"<-"+upstream+"@"+target.Owner, since, func(since time.Time) error {
+		return e.syncOneWay(ctx, src, parent, e.canonicalSink, canonical, since)
+	})
+}
+
+// runFlow runs one flow with its look-back widened by flowSince, and makes the
+// run the flow's new resume point only if it succeeded.
+func (e *Engine) runFlow(key string, since time.Time, run func(since time.Time) error) error {
+	start := time.Now()
+	if err := run(e.flowSince(key, since)); err != nil {
+		return err
+	}
+	if e.lastSynced == nil {
+		e.lastSynced = map[string]time.Time{}
+	}
+	e.lastSynced[key] = start
+	return nil
+}
+
+// flowSince widens since back to the flow's last successful run, so a flow
+// that kept failing (a forge outage, a revoked token) catches up once it
+// recovers instead of skipping everything that changed meanwhile. A flow that
+// has never succeeded resumes from the first tick's look-back. The widening
+// stops at InitialBackfill, the same bound a restart gets.
+func (e *Engine) flowSince(key string, since time.Time) time.Time {
+	resume := e.initialSince
+	if last, ok := e.lastSynced[key]; ok {
+		// One poll interval of overlap, as Window() allows for a normal tick.
+		resume = last.Add(-e.cfg.PollInterval)
+	}
+	if floor := time.Now().Add(-e.cfg.InitialBackfill); resume.Before(floor) {
+		resume = floor
+	}
+	if resume.Before(since) {
+		return resume
+	}
+	return since
 }
 
 // detectAndPromotePRs looks for [PR #N] shadow issues with a /sync comment and
@@ -260,7 +365,9 @@ func (e *Engine) detectAndPromotePRs(ctx context.Context, canonical source.Repo,
 			continue
 		}
 		m, ok := marker.Parse(iss.Body)
-		if !ok || m.Host != githubHost || m.Kind != kindIssue {
+		// The shadow must come from this mirror: with several GitHub mirrors,
+		// another mirror's PR #N would otherwise be fetched and closed here.
+		if !ok || m.Host != githubHost || m.Kind != kindIssue || m.Repo != target.Slug() {
 			continue
 		}
 
@@ -451,7 +558,38 @@ func (e *Engine) syncOutbound(ctx context.Context, canonical source.Repo, host s
 	if err != nil {
 		return err
 	}
-	return e.syncOneWay(ctx, e.canonicalSrc, canonical, dst, target, since)
+	return e.syncOneWay(ctx, localOnlyFilter{e.canonicalSrc}, canonical, dst, target, since)
+}
+
+// localOnlyFilter hides native canonical issues labelled local-only from Flow
+// B, so they never leave the canonical Forgejo. Shadows are kept: they already
+// exist on the target, and replies to them should still flow back.
+type localOnlyFilter struct {
+	source.Provider
+}
+
+func (f localOnlyFilter) ListIssues(ctx context.Context, repo source.Repo, opts source.ListOpts) ([]source.Issue, error) {
+	issues, err := f.Provider.ListIssues(ctx, repo, opts)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]source.Issue, 0, len(issues))
+	for _, iss := range issues {
+		if !marker.Has(iss.Body) && hasLabel(iss.Labels, localOnlyLabel) {
+			continue
+		}
+		out = append(out, iss)
+	}
+	return out, nil
+}
+
+func hasLabel(labels []string, name string) bool {
+	for _, l := range labels {
+		if strings.EqualFold(l, name) {
+			return true
+		}
+	}
+	return false
 }
 
 // syncOneWay applies the shared per-direction logic: list issues from `src`,
@@ -474,8 +612,14 @@ func (e *Engine) syncOneWay(ctx context.Context, src source.Provider, srcRepo so
 		"direction", src.Kind()+"→"+dst.Kind(),
 		"src_repo", srcRepo.Slug(), "count", len(issues))
 
+	// Item failures are logged as they happen and counted, so the flow reports
+	// failure and runFlow keeps its resume point for the next tick to retry.
+	var failed int
 	for _, iss := range issues {
-		destNum, ok := e.routeIssue(ctx, src, srcRepo, dst, dstRepo, iss)
+		destNum, ok, err := e.routeIssue(ctx, src, srcRepo, dst, dstRepo, iss)
+		if err != nil {
+			failed++
+		}
 		if !ok {
 			continue
 		}
@@ -484,6 +628,7 @@ func (e *Engine) syncOneWay(ctx context.Context, src source.Provider, srcRepo so
 		if err != nil {
 			e.log.Error("list comments failed",
 				"src_repo", srcRepo.Slug(), "src_num", iss.Number, "err", err)
+			failed++
 			continue
 		}
 		var (
@@ -507,6 +652,7 @@ func (e *Engine) syncOneWay(ctx context.Context, src source.Provider, srcRepo so
 				e.log.Error("upsert comment failed",
 					"dst_repo", dstRepo.Slug(), "dst_issue", destNum,
 					"src_comment", c.ID, "err", err)
+				failed++
 			}
 		}
 		if len(comments) > 0 {
@@ -516,29 +662,32 @@ func (e *Engine) syncOneWay(ctx context.Context, src source.Provider, srcRepo so
 				"total", len(comments), "native", nativeComments, "shadows", shadowFiltered)
 		}
 	}
+	if failed > 0 {
+		return fmt.Errorf("%d item(s) failed to sync", failed)
+	}
 	return nil
 }
 
 // routeIssue decides what destination issue number to use for an item read
 // from src. It returns (destNum, true) when comments under this issue should
-// be processed.
+// be processed, and an error only when the upsert failed.
 //
 //   - Native issue (no marker): upsert to dst, return the new dest number.
 //   - Shadow whose marker points at the current dst: don't upsert (loop), but
 //     return the marker's ID so native comments can be parented correctly.
 //   - Shadow pointing somewhere else: skip — not our concern in this direction.
-func (e *Engine) routeIssue(ctx context.Context, src source.Provider, srcRepo source.Repo, dst sink.Sink, dstRepo source.Repo, iss source.Issue) (int64, bool) {
+func (e *Engine) routeIssue(ctx context.Context, src source.Provider, srcRepo source.Repo, dst sink.Sink, dstRepo source.Repo, iss source.Issue) (int64, bool, error) {
 	if m, isShadow := marker.Parse(iss.Body); isShadow {
 		if m.Type != dst.Kind() || m.Repo != dstRepo.Slug() || m.Kind != kindIssue {
 			e.log.Debug("foreign shadow skipped",
 				"src_repo", srcRepo.Slug(), "src_num", iss.Number,
 				"marker_type", m.Type, "marker_repo", m.Repo)
-			return 0, false
+			return 0, false, nil
 		}
 		e.log.Debug("shadow routed for comment-only sync",
 			"src_repo", srcRepo.Slug(), "src_num", iss.Number,
 			"dst_repo", dstRepo.Slug(), "dst_num", m.ID)
-		return m.ID, true
+		return m.ID, true, nil
 	}
 	issueMarker := marker.Marker{
 		Type: src.Kind(),
@@ -552,9 +701,9 @@ func (e *Engine) routeIssue(ctx context.Context, src source.Provider, srcRepo so
 		e.log.Error("upsert issue failed",
 			"src_repo", srcRepo.Slug(), "src_num", iss.Number,
 			"dst_repo", dstRepo.Slug(), "err", err)
-		return 0, false
+		return 0, false, err
 	}
-	return destNum, true
+	return destNum, true, nil
 }
 
 func (e *Engine) sourceForHost(host string) (source.Provider, error) {

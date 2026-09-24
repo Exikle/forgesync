@@ -2,11 +2,15 @@ package syncloop
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"testing"
 	"time"
 
+	"code.gitea.io/sdk/gitea"
+
+	"git.erwanleboucher.dev/eleboucher/forgesync/internal/config"
 	"git.erwanleboucher.dev/eleboucher/forgesync/internal/marker"
 	"git.erwanleboucher.dev/eleboucher/forgesync/internal/source"
 )
@@ -19,6 +23,7 @@ const (
 	tRepoFork = "fork"
 	tRepoSrc  = "src"
 	tOwner    = "me"
+	tUpstream = "up/parent"
 )
 
 func forkRepo() source.Repo { return source.Repo{Owner: tOwner, Name: tRepoFork} }
@@ -51,10 +56,14 @@ type fakeSink struct {
 	issueMarkers    []marker.Marker
 	commentMarkers  []marker.Marker
 	commentDestNums []int64
+	failIssue       int64 // UpsertIssue fails for this source id
 }
 
 func (f *fakeSink) Kind() string { return f.kind }
 func (f *fakeSink) UpsertIssue(_ context.Context, _ source.Repo, _ source.Issue, m marker.Marker) (int64, error) {
+	if f.failIssue != 0 && m.ID == f.failIssue {
+		return 0, errors.New("upsert failed")
+	}
 	f.issueMarkers = append(f.issueMarkers, m)
 	return m.ID, nil // mirror the source id
 }
@@ -180,6 +189,247 @@ func TestSyncOneWay_FiltersShadowComments(t *testing.T) {
 	}
 	if sink.commentMarkers[0].ID != 10 {
 		t.Errorf("expected comment id=10, got %d", sink.commentMarkers[0].ID)
+	}
+}
+
+func TestSyncRepo_SkipsReposWithoutAdmin(t *testing.T) {
+	cases := []struct {
+		name      string
+		perms     *gitea.Permission
+		wantCalls int
+	}{
+		{"no permissions reported", nil, 1},
+		{"read only", &gitea.Permission{Pull: true}, 0},
+		{"push without admin", &gitea.Permission{Pull: true, Push: true}, 0},
+		{"admin", &gitea.Permission{Pull: true, Push: true, Admin: true}, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fj := &fakeFJClient{}
+			e := newEngine()
+			e.fjClient = fj
+			repo := &gitea.Repository{FullName: tOwner + "/" + tRepoSrc, Permissions: tc.perms}
+			if err := e.syncRepo(context.Background(), repo, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			if fj.pushMirrorCalls != tc.wantCalls {
+				t.Errorf("ListPushMirrors calls = %d, want %d", fj.pushMirrorCalls, tc.wantCalls)
+			}
+		})
+	}
+}
+
+func TestLocalOnlyFilter_KeepsLabelledNativeIssuesOnCanonical(t *testing.T) {
+	// A shadow labelled local-only still routes its comments: the label only
+	// keeps a canonical-native issue from being published.
+	dstRepo := srcRepo()
+	shadowMarker := marker.Marker{Type: tGithub, Host: tGHHost, Repo: dstRepo.Slug(), Kind: kindIssue, ID: 99}
+	src := &fakeSource{
+		kind: tForgejo, host: tFJHost,
+		issues: []source.Issue{
+			{Number: 1, Body: "public", UpdatedAt: time.Now()},
+			{Number: 2, Body: "private", Labels: []string{"bug", localOnlyLabel}, UpdatedAt: time.Now()},
+			{Number: 3, Body: "private too", Labels: []string{"Local-Only"}, UpdatedAt: time.Now()},
+			{Number: 4, Body: "imported\n\n" + shadowMarker.String(), Labels: []string{localOnlyLabel}, UpdatedAt: time.Now()},
+		},
+		comments: map[int64][]source.Comment{
+			2: {{ID: 20, Body: "stays here", UpdatedAt: time.Now()}},
+			4: {{ID: 40, Body: "reply to the shadow", UpdatedAt: time.Now()}},
+		},
+	}
+	sink := &fakeSink{kind: tGithub}
+	e := newEngine()
+
+	if err := e.syncOneWay(context.Background(), localOnlyFilter{src},
+		forkRepo(), sink, dstRepo, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(sink.issueMarkers) != 1 || sink.issueMarkers[0].ID != 1 {
+		t.Errorf("expected only issue 1 to be published, got %+v", sink.issueMarkers)
+	}
+	if len(sink.commentMarkers) != 1 || sink.commentMarkers[0].ID != 40 {
+		t.Errorf("expected only the shadow's comment to flow, got %+v", sink.commentMarkers)
+	}
+	if len(src.issues) != 4 {
+		t.Errorf("filter must not modify the provider's slice, got %d issues", len(src.issues))
+	}
+}
+
+func TestSyncOneWay_ItemFailureFailsTheFlow(t *testing.T) {
+	// One issue fails: the rest still sync, but the flow reports failure so its
+	// resume point stays put and the next tick retries.
+	src := &fakeSource{
+		kind: tForgejo, host: tFJHost,
+		issues: []source.Issue{
+			{Number: 1, Body: "ok", UpdatedAt: time.Now()},
+			{Number: 2, Body: "fails", UpdatedAt: time.Now()},
+			{Number: 3, Body: "ok too", UpdatedAt: time.Now()},
+		},
+	}
+	sink := &fakeSink{kind: tGithub, failIssue: 2}
+	e := newEngine()
+	err := e.syncOneWay(context.Background(), src, forkRepo(), sink, srcRepo(), time.Now())
+	if err == nil {
+		t.Fatal("expected the flow to report the failed item")
+	}
+	if len(sink.issueMarkers) != 2 {
+		t.Errorf("expected the other 2 issues to sync, got %d", len(sink.issueMarkers))
+	}
+}
+
+func TestRunFlow_ResumesFromLastSuccess(t *testing.T) {
+	const key = "me/src<-github.com/me/fork"
+	e := newEngine()
+	e.cfg = &config.Config{PollInterval: 5 * time.Minute, InitialBackfill: 24 * time.Hour}
+	e.initialSince = time.Now().Add(-e.cfg.InitialBackfill)
+
+	var got time.Time
+	record := func(since time.Time) error { got = since; return nil }
+	fail := func(since time.Time) error { got = since; return errors.New("github is down") }
+	near := func(a, b time.Time) bool { return a.Sub(b).Abs() < time.Second }
+
+	// Never succeeded: resume from the first tick's look-back.
+	if err := e.runFlow(key, time.Now().Add(-e.cfg.Window()), record); err != nil {
+		t.Fatal(err)
+	}
+	if !near(got, e.initialSince) {
+		t.Errorf("first run since = %v, want the initial look-back %v", got, e.initialSince)
+	}
+
+	// Healthy: the usual window, nothing wider.
+	window := time.Now().Add(-e.cfg.Window())
+	if err := e.runFlow(key, window, record); err != nil {
+		t.Fatal(err)
+	}
+	if !near(got, window) {
+		t.Errorf("healthy run since = %v, want the window %v", got, window)
+	}
+
+	// Last success three hours ago: failed runs keep reaching back to it.
+	lastOK := time.Now().Add(-3 * time.Hour)
+	e.lastSynced[key] = lastOK
+	for range 2 {
+		if err := e.runFlow(key, time.Now().Add(-e.cfg.Window()), fail); err == nil {
+			t.Fatal("expected the failure to be returned")
+		}
+		if want := lastOK.Add(-e.cfg.PollInterval); !near(got, want) {
+			t.Errorf("failed run since = %v, want %v", got, want)
+		}
+	}
+	if !e.lastSynced[key].Equal(lastOK) {
+		t.Errorf("a failed run must not move the resume point")
+	}
+
+	// Older than InitialBackfill: capped, like a restart.
+	e.lastSynced[key] = time.Now().Add(-72 * time.Hour)
+	if err := e.runFlow(key, time.Now().Add(-e.cfg.Window()), record); err != nil {
+		t.Fatal(err)
+	}
+	if want := time.Now().Add(-e.cfg.InitialBackfill); !near(got, want) {
+		t.Errorf("capped since = %v, want %v", got, want)
+	}
+	if time.Since(e.lastSynced[key]) > time.Second {
+		t.Errorf("a successful run must become the resume point")
+	}
+}
+
+// fakeUpstream implements upstreamSource.
+type fakeUpstream struct {
+	parent      source.Repo
+	isFork      bool
+	prs         *fakeSource
+	author      string
+	parentCalls int
+}
+
+func (f *fakeUpstream) Parent(context.Context, source.Repo) (source.Repo, bool, error) {
+	f.parentCalls++
+	return f.parent, f.isFork, nil
+}
+
+func (f *fakeUpstream) UpstreamPullRequests(author string) source.Provider {
+	f.author = author
+	return f.prs
+}
+
+func TestSyncUpstreamPRs(t *testing.T) {
+	canonical := srcRepo()
+	target := forkRepo()
+	parent := source.Repo{Owner: "up", Name: "parent"}
+
+	cases := []struct {
+		name        string
+		host        string
+		isFork      bool
+		mirrored    map[string]bool
+		wantUpserts int
+	}{
+		{"fork on github", githubHost, true, nil, 1},
+		{"not a fork", githubHost, false, nil, 0},
+		{"non-github host skipped", tFJHost, true, nil, 0},
+		// Flow A already imports the parent's PRs; don't fight it over shadows.
+		{"parent is also a mirror", githubHost, true, map[string]bool{"github.com/up/parent": true}, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			up := &fakeUpstream{
+				parent: parent, isFork: tc.isFork,
+				prs: &fakeSource{kind: tGithub, host: tGHHost, issues: []source.Issue{
+					{Number: 4, Title: "[upstream PR #4] add postgres", State: stateOpen, UpdatedAt: time.Now()},
+				}},
+			}
+			cs := &fakeCanonicalSink{}
+			e := newEngine()
+			e.cfg = &config.Config{
+				PollInterval: 5 * time.Minute, InitialBackfill: time.Hour,
+				Targets: config.Targets{GitHub: config.GitHubTarget{Token: "t"}},
+			}
+			e.upstream = up
+			e.canonicalSink = cs
+
+			if err := e.syncUpstreamPRs(context.Background(), canonical, tc.host, target, time.Now(), tc.mirrored); err != nil {
+				t.Fatal(err)
+			}
+			if len(cs.issueMarkers) != tc.wantUpserts {
+				t.Fatalf("upserts = %d, want %d", len(cs.issueMarkers), tc.wantUpserts)
+			}
+			if tc.wantUpserts == 0 {
+				return
+			}
+			if up.author != tOwner {
+				t.Errorf("PRs read for author %q, want the fork owner %q", up.author, tOwner)
+			}
+			want := marker.Marker{Type: tGithub, Host: tGHHost, Repo: parent.Slug(), Kind: kindIssue, ID: 4}
+			if cs.issueMarkers[0] != want {
+				t.Errorf("marker: got %+v want %+v", cs.issueMarkers[0], want)
+			}
+		})
+	}
+}
+
+func TestUpstreamPRShadow_NeverFlowsOut(t *testing.T) {
+	// The shadow and a reply to it sit in canonical. Flow B to the fork must
+	// treat the shadow as foreign: nothing reaches the fork, or the parent.
+	shadow := marker.Marker{Type: tGithub, Host: tGHHost, Repo: tUpstream, Kind: kindIssue, ID: 4}
+	src := &fakeSource{
+		kind: tForgejo, host: tFJHost,
+		issues: []source.Issue{
+			{Number: 9, Title: "[upstream PR #4] add postgres", Body: "x\n\n" + shadow.String(), UpdatedAt: time.Now()},
+		},
+		comments: map[int64][]source.Comment{
+			9: {{ID: 90, Body: "note to self", UpdatedAt: time.Now()}},
+		},
+	}
+	sink := &fakeSink{kind: tGithub}
+	e := newEngine()
+	if err := e.syncOneWay(context.Background(), localOnlyFilter{src},
+		srcRepo(), sink, forkRepo(), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.issueMarkers) != 0 || len(sink.commentMarkers) != 0 {
+		t.Errorf("expected nothing written out, got issues=%d comments=%d",
+			len(sink.issueMarkers), len(sink.commentMarkers))
 	}
 }
 

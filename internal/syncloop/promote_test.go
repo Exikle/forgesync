@@ -22,9 +22,10 @@ type recorder struct{ events []string }
 
 // fakeFJClient implements forgejoClient.
 type fakeFJClient struct {
-	rec        *recorder
-	openIssues []*gitea.Issue
-	comments   []gitea.CreateIssueCommentOption
+	rec             *recorder
+	openIssues      []*gitea.Issue
+	comments        []gitea.CreateIssueCommentOption
+	pushMirrorCalls int
 }
 
 func (f *fakeFJClient) SetContext(context.Context) {}
@@ -34,6 +35,7 @@ func (f *fakeFJClient) SearchRepos(gitea.SearchRepoOptions) ([]*gitea.Repository
 }
 
 func (f *fakeFJClient) ListPushMirrors(string, string, gitea.ListOptions) ([]*gitea.PushMirrorResponse, *gitea.Response, error) {
+	f.pushMirrorCalls++
 	return nil, nil, nil
 }
 
@@ -55,14 +57,18 @@ func (f *fakeFJClient) EditIssue(_, _ string, _ int64, opt gitea.EditIssueOption
 
 // fakeCanonicalSink implements canonicalPRSink.
 type fakeCanonicalSink struct {
-	hasShadow   bool
-	upsertNum   int64
-	upsertCalls int
+	hasShadow    bool
+	upsertNum    int64
+	upsertCalls  int
+	issueMarkers []marker.Marker
+	issueTitles  []string
 }
 
 func (f *fakeCanonicalSink) Kind() string { return "forgejo" }
 
-func (f *fakeCanonicalSink) UpsertIssue(context.Context, source.Repo, source.Issue, marker.Marker) (int64, error) {
+func (f *fakeCanonicalSink) UpsertIssue(_ context.Context, _ source.Repo, iss source.Issue, m marker.Marker) (int64, error) {
+	f.issueMarkers = append(f.issueMarkers, m)
+	f.issueTitles = append(f.issueTitles, iss.Title)
 	return 0, nil
 }
 
@@ -127,12 +133,15 @@ func testEngine(fj *fakeFJClient, cs *fakeCanonicalSink, ghSink *fakeGHSink, prS
 	}
 }
 
-const tBot = "forgesync-bot"
+const (
+	tBot     = "forgesync-bot"
+	tPRTitle = "[PR #7] thing"
+)
 
 func TestPromotePR_CloseOrdering(t *testing.T) {
 	canonical := source.Repo{Owner: tOwner, Name: tRepoSrc}
 	target := source.Repo{Owner: tOwner, Name: tRepoSrc}
-	iss := source.Issue{Number: 14, Title: "[PR #7] thing"}
+	iss := source.Issue{Number: 14, Title: tPRTitle}
 	issMarker := marker.Marker{Type: tGithub, Host: tGHHost, Repo: target.Slug(), Kind: kindIssue, ID: 7}
 	prMarker := marker.Marker{Type: tGithub, Host: tGHHost, Repo: target.Slug(), Kind: kindPullRequest, ID: 7}
 
@@ -189,7 +198,7 @@ func TestDetectAndPromotePRs(t *testing.T) {
 	prShadowMarker := marker.Marker{Type: tGithub, Host: tGHHost, Repo: target.Slug(), Kind: kindIssue, ID: 7}
 
 	prShadowIssue := func() *gitea.Issue {
-		return &gitea.Issue{Index: 14, Title: "[PR #7] thing", Body: "body\n\n" + prShadowMarker.String()}
+		return &gitea.Issue{Index: 14, Title: tPRTitle, Body: "body\n\n" + prShadowMarker.String()}
 	}
 	syncComment := map[int64][]source.Comment{
 		14: {{Author: source.User{Login: "alice"}, Body: syncCommand}},
@@ -211,6 +220,11 @@ func TestDetectAndPromotePRs(t *testing.T) {
 		{"already promoted retries close", githubHost, []*gitea.Issue{prShadowIssue()}, syncComment, true, false, 1},
 		{"non-github host skipped", tFJHost, []*gitea.Issue{prShadowIssue()}, syncComment, false, false, 0},
 		{"non-PR issue ignored", githubHost, []*gitea.Issue{{Index: 1, Title: "regular bug"}}, nil, false, false, 0},
+		// A PR shadow from a different GitHub mirror of the same repo.
+		{"other mirror's PR ignored", githubHost, []*gitea.Issue{{
+			Index: 14, Title: tPRTitle,
+			Body: "body\n\n" + marker.Marker{Type: tGithub, Host: tGHHost, Repo: "someone/else", Kind: kindIssue, ID: 7}.String(),
+		}}, syncComment, false, false, 0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
